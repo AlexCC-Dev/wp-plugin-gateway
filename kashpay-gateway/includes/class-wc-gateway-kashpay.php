@@ -9,9 +9,7 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     $this->method_description = 'Paga con KashPay (Link de pago) usando OrderReceiver.';
     $this->has_fields         = false;
 
-    $this->supports = [
-      'products',
-    ];
+    $this->supports = ['products'];
 
     $this->init_form_fields();
     $this->init_settings();
@@ -22,10 +20,7 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
 
     add_action('woocommerce_update_options_payment_gateways_' . $this->id, [$this, 'process_admin_options']);
 
-    // Endpoint de regreso: /?wc-api=wc_kashpay_return&order_id=123&key=wc_order_key
     add_action('woocommerce_api_wc_kashpay_return', [$this, 'handle_return']);
-
-    // (Opcional) Endpoint webhook: /?wc-api=wc_kashpay_webhook
     add_action('woocommerce_api_wc_kashpay_webhook', [$this, 'handle_webhook']);
   }
 
@@ -38,9 +33,9 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
         'default' => 'no',
       ],
       'title' => [
-        'title'       => 'Título',
-        'type'        => 'text',
-        'default'     => 'KashPay',
+        'title'   => 'Título',
+        'type'    => 'text',
+        'default' => 'KashPay',
       ],
       'description' => [
         'title'   => 'Descripción',
@@ -53,6 +48,13 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
         'description' => 'Ej sandbox: https://sdbx-antares.kashplataforma.com',
         'default'     => 'https://sdbx-antares.kashplataforma.com',
       ],
+      'sandbox' => [
+        'title'       => 'Sandbox',
+        'type'        => 'checkbox',
+        'label'       => 'Modo sandbox (desactiva verificación SSL SOLO para pruebas)',
+        'default'     => 'yes',
+        'description' => 'En IONOS puede fallar SSL en sandbox. En producción debe estar en NO.',
+      ],
       'bearer_token' => [
         'title'       => 'Bearer Token',
         'type'        => 'password',
@@ -60,19 +62,19 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
         'default'     => '',
       ],
       'entity_i' => [
-        'title'       => 'Entity-i',
-        'type'        => 'text',
-        'default'     => 'com.onsigna',
+        'title'   => 'Entity-i',
+        'type'    => 'text',
+        'default' => 'com.onsigna',
       ],
       'sirio_id' => [
-        'title'       => 'sirioID (comercio)',
-        'type'        => 'text',
-        'default'     => '',
+        'title'   => 'sirioID (comercio)',
+        'type'    => 'text',
+        'default' => '',
       ],
       'cashier_user' => [
-        'title'       => 'user (cajero)',
-        'type'        => 'text',
-        'default'     => '',
+        'title'   => 'user (cajero)',
+        'type'    => 'text',
+        'default' => '',
       ],
       'currency_code' => [
         'title'       => 'Currency (ISO num)',
@@ -81,10 +83,10 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
         'default'     => '484',
       ],
       'payment_type' => [
-        'title'       => 'paymentType',
-        'type'        => 'select',
-        'default'     => '1',
-        'options'     => [
+        'title'   => 'paymentType',
+        'type'    => 'select',
+        'default' => '1',
+        'options' => [
           '1' => '1 - COMPLETO',
           '2' => '2 - DIVIDIDO',
           '3' => '3 - MIXTO',
@@ -97,27 +99,42 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
         'default'     => '5',
       ],
       'expiration_minutes' => [
-        'title'       => 'Expiración (minutos)',
-        'type'        => 'number',
-        'default'     => 60,
+        'title'   => 'Expiración (minutos)',
+        'type'    => 'number',
+        'default' => 60,
       ],
       'debug' => [
         'title'   => 'Debug',
         'type'    => 'checkbox',
-        'label'   => 'Escribir logs en error_log',
+        'label'   => 'Escribir logs en WooCommerce Logs',
         'default' => 'no',
       ],
     ];
   }
 
   private function api(): KashPay_API {
-    $debug = ($this->get_option('debug') === 'yes');
+    $debug   = ($this->get_option('debug') === 'yes');
+    $sandbox = ($this->get_option('sandbox') === 'yes');
+
     return new KashPay_API(
       (string) $this->get_option('base_url'),
       (string) $this->get_option('bearer_token'),
       (string) $this->get_option('entity_i'),
-      $debug
+      $debug,
+      $sandbox
     );
+  }
+
+  private function log_info(string $msg): void {
+    if ($this->get_option('debug') === 'yes' && function_exists('wc_get_logger')) {
+      wc_get_logger()->info($msg, ['source' => 'kashpay']);
+    }
+  }
+
+  private function log_error(string $msg): void {
+    if ($this->get_option('debug') === 'yes' && function_exists('wc_get_logger')) {
+      wc_get_logger()->error($msg, ['source' => 'kashpay']);
+    }
   }
 
   public function process_payment($order_id) {
@@ -127,21 +144,35 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       return ['result' => 'failure'];
     }
 
-    // Si ya tiene kash_order_id guardado, no creamos otro
-    $existing = $order->get_meta('_kashpay_order_id');
-    if (!empty($existing)) {
-      $pay_url = $order->get_meta('_kashpay_pay_url');
-      if ($pay_url) {
-        return ['result' => 'success', 'redirect' => $pay_url];
-      }
-    }
-
     $sirio_id = trim((string) $this->get_option('sirio_id'));
     $cashier  = trim((string) $this->get_option('cashier_user'));
+    $token    = trim((string) $this->get_option('bearer_token'));
 
-    if ($sirio_id === '' || $cashier === '' || trim((string) $this->get_option('bearer_token')) === '') {
+    if ($sirio_id === '' || $cashier === '' || $token === '') {
       wc_add_notice('KashPay no está configurado (sirioID/user/token).', 'error');
       return ['result' => 'failure'];
+    }
+
+    $existing = (string) $order->get_meta('_kashpay_order_id');
+    if ($existing !== '') {
+      $this->log_info('Existing _kashpay_order_id=' . $existing . ' - validating via GET');
+
+      $check = $this->api()->get_order($existing);
+      $this->log_info('Response get_order(existing): ' . wp_json_encode($check));
+
+      if (!empty($check['ok']) && !empty($check['data']['success'])) {
+        $pay_url = (string) $order->get_meta('_kashpay_pay_url');
+        if ($pay_url !== '') {
+          return ['result' => 'success', 'redirect' => $pay_url];
+        }
+      }
+
+      $order->delete_meta_data('_kashpay_order_id');
+      $order->delete_meta_data('_kashpay_pay_url');
+      $order->delete_meta_data('_kashpay_status_id');
+      $order->save();
+
+      $this->log_info('Existing KashPay reference invalid. Meta cleared to regenerate.');
     }
 
     $total = (float) $order->get_total();
@@ -153,15 +184,12 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     $expiration_minutes = max(5, (int) $this->get_option('expiration_minutes'));
     $expiration_iso     = gmdate('Y-m-d\TH:i:s', time() + ($expiration_minutes * 60)); // UTC
 
-    // Return URL (usuario regresa)
     $return_url = add_query_arg([
       'wc-api'   => 'wc_kashpay_return',
       'order_id' => $order->get_id(),
       'key'      => $order->get_order_key(),
     ], home_url('/'));
 
-    // NOTA: Tu doc menciona urlCallback como opcional. Aquí lo usamos para "return".
-    // Si ellos lo usan como webhook server-to-server, también te sirve.
     $payload = [
       'user' => $cashier,
       'amount' => round($total, 2),
@@ -172,8 +200,8 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       ],
       'currency' => (string) $this->get_option('currency_code'),
       'retrievalReferenceCode' => $this->build_rrc($order),
-      'orderType' => ['id' => 2], // 2 = LINK DE PAGO (según tu doc)
-      'notificationType' => ['notificationTypeID' => 1], // 1 = URL
+      'orderType' => ['id' => 2],
+      'notificationType' => ['notificationTypeID' => 1],
       'products' => $this->build_products($order),
       'customerInfo' => [
         'firstName'  => $order->get_billing_first_name() ?: 'Cliente',
@@ -195,11 +223,25 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       'tip' => false,
     ];
 
+    $this->log_info('Payload create_order: ' . wp_json_encode($payload));
+
     $res = $this->api()->create_order($payload);
+
+    $this->log_info('Response create_order: ' . wp_json_encode($res));
 
     if (!$res['ok'] || empty($res['data']['success'])) {
       $msg = 'No se pudo crear el link de pago.';
-      if (!empty($res['data']['error'])) $msg .= ' ' . wp_strip_all_tags(print_r($res['data']['error'], true));
+
+      if (!empty($res['error']) && stripos($res['error'], 'cURL error 60') !== false) {
+        $msg = 'No se pudo conectar con KashPay (error SSL del servidor).';
+      }
+
+      if (!empty($res['data']['error'])) {
+        $msg .= ' ' . wp_strip_all_tags(print_r($res['data']['error'], true));
+      } elseif (!empty($res['data']['raw'])) {
+        $msg .= ' Respuesta: ' . wp_strip_all_tags(substr((string)$res['data']['raw'], 0, 180));
+      }
+
       $order->add_order_note('[KashPay] Error creando orden: ' . $msg);
       wc_add_notice($msg, 'error');
       return ['result' => 'failure'];
@@ -217,14 +259,13 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       return ['result' => 'failure'];
     }
 
-    $redirect = $pay_url ?: $form_url;
+    $redirect = $form_url ?: $pay_url;
 
     $order->update_meta_data('_kashpay_order_id', $kash_order_id);
     $order->update_meta_data('_kashpay_pay_url', $redirect);
     $order->update_meta_data('_kashpay_status_id', 13);
     $order->save();
 
-    // Dejar pedido "pending" mientras pagan afuera
     $order->update_status('pending', '[KashPay] Link de pago generado. Redirigiendo a KashPay.');
 
     return [
@@ -234,7 +275,6 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
   }
 
   private function build_rrc(WC_Order $order): string {
-    // Alfanumérico sin caracteres especiales, <= 40
     $base = 'WC' . $order->get_id() . '-' . time();
     $base = preg_replace('/[^A-Za-z0-9\-]/', '', $base);
     return substr($base, 0, 40);
@@ -257,7 +297,6 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       ];
     }
 
-    // Si no hay items (raro), manda un genérico
     if (empty($items)) {
       $items[] = [
         'description' => 'Pedido WooCommerce',
@@ -271,9 +310,6 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     return $items;
   }
 
-  /**
-   * Maneja el regreso del usuario. Valida order_id + key y confirma por API (GET).
-   */
   public function handle_return() {
     $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
     $key      = isset($_GET['key']) ? wc_clean(wp_unslash($_GET['key'])) : '';
@@ -297,22 +333,14 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
 
     $this->sync_order_status_from_kashpay($order);
 
-    // Redirigir a la página de "order received"
     wp_safe_redirect($order->get_checkout_order_received_url());
     exit;
   }
 
-  /**
-   * Webhook opcional. Ideal si KashPay pega server-to-server.
-   * Puedes hacer que te manden al endpoint: https://tudominio.com/?wc-api=wc_kashpay_webhook
-   */
   public function handle_webhook() {
-    // Leer body por si envían JSON (depende de KashPay)
     $raw  = file_get_contents('php://input');
     $json = json_decode($raw, true);
 
-    // Estrategia: si nos mandan algún identificador, lo usamos. Si no, no rompemos.
-    // Lo más confiable: que nos manden el kash_order_id (UUID).
     $kash_order_id = '';
     if (is_array($json)) {
       $kash_order_id = $json['orderId'] ?? ($json['id'] ?? '');
@@ -324,7 +352,6 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       exit;
     }
 
-    // Buscar pedido WooCommerce por meta _kashpay_order_id
     $orders = wc_get_orders([
       'limit'      => 1,
       'meta_key'   => '_kashpay_order_id',
@@ -343,9 +370,6 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     exit;
   }
 
-  /**
-   * Consulta KashPay GET /order/{id} y aplica reglas de estado.
-   */
   private function sync_order_status_from_kashpay(WC_Order $order): void {
     $kash_order_id = (string) $order->get_meta('_kashpay_order_id');
     if (!$kash_order_id) {
@@ -353,12 +377,13 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       return;
     }
 
-    // Idempotencia: si ya está pagado en WooCommerce, no reprocesar
     if ($order->is_paid()) {
       return;
     }
 
     $res = $this->api()->get_order($kash_order_id);
+
+    $this->log_info('Response get_order(sync): ' . wp_json_encode($res));
 
     if (!$res['ok'] || empty($res['data']['success'])) {
       $order->add_order_note('[KashPay] Error consultando orden ' . $kash_order_id . '.');
@@ -373,29 +398,25 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     $order->update_meta_data('_kashpay_status_id', $status_id);
     $order->save();
 
-    // Anti-fraude básico: monto y currency
     $expected_total = round((float) $order->get_total(), 2);
 
     if ($amount_remote !== null && round($amount_remote, 2) !== $expected_total) {
-      $order->add_order_note('[KashPay] ALERTA: Monto remoto (' . $amount_remote . ') != total pedido (' . $expected_total . '). No se completa.');
+      $order->add_order_note('[KashPay] ALERTA: Monto remoto (' . $amount_remote . ') != total pedido (' . $expected_total . ').');
       $order->update_status('on-hold', '[KashPay] Monto no coincide, requiere revisión.');
       return;
     }
 
     $expected_currency = (string) $this->get_option('currency_code');
     if ($currency_remote !== null && $currency_remote !== $expected_currency) {
-      $order->add_order_note('[KashPay] ALERTA: Currency remoto (' . $currency_remote . ') != esperado (' . $expected_currency . '). No se completa.');
+      $order->add_order_note('[KashPay] ALERTA: Currency remoto (' . $currency_remote . ') != esperado (' . $expected_currency . ').');
       $order->update_status('on-hold', '[KashPay] Moneda no coincide, requiere revisión.');
       return;
     }
 
-    // Mapeo de estados:
-    // 13 CREADA, 14 PAGADA, 15 EXPIRADA, 17 PAGO PARCIAL
     if ($status_id === 14) {
       $order->payment_complete();
       $order->add_order_note('[KashPay] Pago confirmado (statusID=14). Pedido completado por gateway.');
 
-      // Opcional: vaciar carrito si el usuario regresa
       if (function_exists('WC') && WC()->cart) {
         WC()->cart->empty_cart();
       }
@@ -412,7 +433,6 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       return;
     }
 
-    // 13 u otros: mantener pending
     $order->add_order_note('[KashPay] Estado KashPay actual: ' . $status_id . ' (aún no pagado).');
   }
 }

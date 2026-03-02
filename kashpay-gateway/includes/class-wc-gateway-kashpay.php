@@ -1,0 +1,418 @@
+<?php
+if (!defined('ABSPATH')) exit;
+
+class WC_Gateway_KashPay extends WC_Payment_Gateway {
+
+  public function __construct() {
+    $this->id                 = 'kashpay';
+    $this->method_title       = 'KashPay';
+    $this->method_description = 'Paga con KashPay (Link de pago) usando OrderReceiver.';
+    $this->has_fields         = false;
+
+    $this->supports = [
+      'products',
+    ];
+
+    $this->init_form_fields();
+    $this->init_settings();
+
+    $this->title       = $this->get_option('title');
+    $this->description = $this->get_option('description');
+    $this->enabled     = $this->get_option('enabled');
+
+    add_action('woocommerce_update_options_payment_gateways_' . $this->id, [$this, 'process_admin_options']);
+
+    // Endpoint de regreso: /?wc-api=wc_kashpay_return&order_id=123&key=wc_order_key
+    add_action('woocommerce_api_wc_kashpay_return', [$this, 'handle_return']);
+
+    // (Opcional) Endpoint webhook: /?wc-api=wc_kashpay_webhook
+    add_action('woocommerce_api_wc_kashpay_webhook', [$this, 'handle_webhook']);
+  }
+
+  public function init_form_fields() {
+    $this->form_fields = [
+      'enabled' => [
+        'title'   => 'Habilitar/Deshabilitar',
+        'type'    => 'checkbox',
+        'label'   => 'Habilitar KashPay',
+        'default' => 'no',
+      ],
+      'title' => [
+        'title'       => 'Título',
+        'type'        => 'text',
+        'default'     => 'KashPay',
+      ],
+      'description' => [
+        'title'   => 'Descripción',
+        'type'    => 'textarea',
+        'default' => 'Paga de forma segura con KashPay.',
+      ],
+      'base_url' => [
+        'title'       => 'Base URL API',
+        'type'        => 'text',
+        'description' => 'Ej sandbox: https://sdbx-antares.kashplataforma.com',
+        'default'     => 'https://sdbx-antares.kashplataforma.com',
+      ],
+      'bearer_token' => [
+        'title'       => 'Bearer Token',
+        'type'        => 'password',
+        'description' => 'Token Bearer de KashPay/Onsigna',
+        'default'     => '',
+      ],
+      'entity_i' => [
+        'title'       => 'Entity-i',
+        'type'        => 'text',
+        'default'     => 'com.onsigna',
+      ],
+      'sirio_id' => [
+        'title'       => 'sirioID (comercio)',
+        'type'        => 'text',
+        'default'     => '',
+      ],
+      'cashier_user' => [
+        'title'       => 'user (cajero)',
+        'type'        => 'text',
+        'default'     => '',
+      ],
+      'currency_code' => [
+        'title'       => 'Currency (ISO num)',
+        'type'        => 'text',
+        'description' => 'MXN = 484',
+        'default'     => '484',
+      ],
+      'payment_type' => [
+        'title'       => 'paymentType',
+        'type'        => 'select',
+        'default'     => '1',
+        'options'     => [
+          '1' => '1 - COMPLETO',
+          '2' => '2 - DIVIDIDO',
+          '3' => '3 - MIXTO',
+        ],
+      ],
+      'payment_method_id' => [
+        'title'       => 'paymentMethodID',
+        'type'        => 'text',
+        'description' => 'Según tu comercio. En ejemplos aparece 5 (Tarjeta).',
+        'default'     => '5',
+      ],
+      'expiration_minutes' => [
+        'title'       => 'Expiración (minutos)',
+        'type'        => 'number',
+        'default'     => 60,
+      ],
+      'debug' => [
+        'title'   => 'Debug',
+        'type'    => 'checkbox',
+        'label'   => 'Escribir logs en error_log',
+        'default' => 'no',
+      ],
+    ];
+  }
+
+  private function api(): KashPay_API {
+    $debug = ($this->get_option('debug') === 'yes');
+    return new KashPay_API(
+      (string) $this->get_option('base_url'),
+      (string) $this->get_option('bearer_token'),
+      (string) $this->get_option('entity_i'),
+      $debug
+    );
+  }
+
+  public function process_payment($order_id) {
+    $order = wc_get_order($order_id);
+    if (!$order) {
+      wc_add_notice('No se pudo iniciar el pago (pedido inválido).', 'error');
+      return ['result' => 'failure'];
+    }
+
+    // Si ya tiene kash_order_id guardado, no creamos otro
+    $existing = $order->get_meta('_kashpay_order_id');
+    if (!empty($existing)) {
+      $pay_url = $order->get_meta('_kashpay_pay_url');
+      if ($pay_url) {
+        return ['result' => 'success', 'redirect' => $pay_url];
+      }
+    }
+
+    $sirio_id = trim((string) $this->get_option('sirio_id'));
+    $cashier  = trim((string) $this->get_option('cashier_user'));
+
+    if ($sirio_id === '' || $cashier === '' || trim((string) $this->get_option('bearer_token')) === '') {
+      wc_add_notice('KashPay no está configurado (sirioID/user/token).', 'error');
+      return ['result' => 'failure'];
+    }
+
+    $total = (float) $order->get_total();
+    if ($total <= 0) {
+      wc_add_notice('Monto inválido para KashPay.', 'error');
+      return ['result' => 'failure'];
+    }
+
+    $expiration_minutes = max(5, (int) $this->get_option('expiration_minutes'));
+    $expiration_iso     = gmdate('Y-m-d\TH:i:s', time() + ($expiration_minutes * 60)); // UTC
+
+    // Return URL (usuario regresa)
+    $return_url = add_query_arg([
+      'wc-api'   => 'wc_kashpay_return',
+      'order_id' => $order->get_id(),
+      'key'      => $order->get_order_key(),
+    ], home_url('/'));
+
+    // NOTA: Tu doc menciona urlCallback como opcional. Aquí lo usamos para "return".
+    // Si ellos lo usan como webhook server-to-server, también te sirve.
+    $payload = [
+      'user' => $cashier,
+      'amount' => round($total, 2),
+      'sirioID' => $sirio_id,
+      'paymentType' => (int) $this->get_option('payment_type'),
+      'paymentMethod' => [
+        'paymentMethodID' => (int) $this->get_option('payment_method_id'),
+      ],
+      'currency' => (string) $this->get_option('currency_code'),
+      'retrievalReferenceCode' => $this->build_rrc($order),
+      'orderType' => ['id' => 2], // 2 = LINK DE PAGO (según tu doc)
+      'notificationType' => ['notificationTypeID' => 1], // 1 = URL
+      'products' => $this->build_products($order),
+      'customerInfo' => [
+        'firstName'  => $order->get_billing_first_name() ?: 'Cliente',
+        'lastName'   => $order->get_billing_last_name() ?: 'WooCommerce',
+        'middleName' => '',
+        'email'      => $order->get_billing_email() ?: '',
+        'phone1'     => $order->get_billing_phone() ?: '',
+      ],
+      'payInfo' => [
+        'unique'      => true,
+        'reference'   => 'WC-' . $order->get_id(),
+        'description' => 'Pedido WooCommerce #' . $order->get_id(),
+        'expiration'  => $expiration_iso,
+        'urlCallback' => $return_url,
+        'urlImage'    => '',
+      ],
+      'otherAmount' => 0.0,
+      'msi' => false,
+      'tip' => false,
+    ];
+
+    $res = $this->api()->create_order($payload);
+
+    if (!$res['ok'] || empty($res['data']['success'])) {
+      $msg = 'No se pudo crear el link de pago.';
+      if (!empty($res['data']['error'])) $msg .= ' ' . wp_strip_all_tags(print_r($res['data']['error'], true));
+      $order->add_order_note('[KashPay] Error creando orden: ' . $msg);
+      wc_add_notice($msg, 'error');
+      return ['result' => 'failure'];
+    }
+
+    $data = $res['data'];
+
+    $kash_order_id = $data['payOrderResponse']['order']['id'] ?? '';
+    $pay_url       = $data['payOrderResponse']['payOrder'] ?? '';
+    $form_url      = $data['payOrderResponse']['formUrl'] ?? '';
+
+    if (!$kash_order_id || (!$pay_url && !$form_url)) {
+      $order->add_order_note('[KashPay] Respuesta inesperada al crear orden.');
+      wc_add_notice('Respuesta inesperada de KashPay (sin URL de pago).', 'error');
+      return ['result' => 'failure'];
+    }
+
+    $redirect = $pay_url ?: $form_url;
+
+    $order->update_meta_data('_kashpay_order_id', $kash_order_id);
+    $order->update_meta_data('_kashpay_pay_url', $redirect);
+    $order->update_meta_data('_kashpay_status_id', 13);
+    $order->save();
+
+    // Dejar pedido "pending" mientras pagan afuera
+    $order->update_status('pending', '[KashPay] Link de pago generado. Redirigiendo a KashPay.');
+
+    return [
+      'result'   => 'success',
+      'redirect' => $redirect,
+    ];
+  }
+
+  private function build_rrc(WC_Order $order): string {
+    // Alfanumérico sin caracteres especiales, <= 40
+    $base = 'WC' . $order->get_id() . '-' . time();
+    $base = preg_replace('/[^A-Za-z0-9\-]/', '', $base);
+    return substr($base, 0, 40);
+  }
+
+  private function build_products(WC_Order $order): array {
+    $items = [];
+    foreach ($order->get_items() as $item) {
+      $name  = $item->get_name();
+      $qty   = (int) $item->get_quantity();
+      $total = (float) $item->get_total();
+      $unit  = $qty > 0 ? round($total / $qty, 2) : round($total, 2);
+
+      $items[] = [
+        'description' => mb_substr($name, 0, 100),
+        'category'    => 'woocommerce',
+        'count'       => $qty,
+        'price'       => $unit,
+        'tax'         => (float) $item->get_total_tax(),
+      ];
+    }
+
+    // Si no hay items (raro), manda un genérico
+    if (empty($items)) {
+      $items[] = [
+        'description' => 'Pedido WooCommerce',
+        'category'    => 'woocommerce',
+        'count'       => 1,
+        'price'       => round((float) $order->get_total(), 2),
+        'tax'         => (float) $order->get_total_tax(),
+      ];
+    }
+
+    return $items;
+  }
+
+  /**
+   * Maneja el regreso del usuario. Valida order_id + key y confirma por API (GET).
+   */
+  public function handle_return() {
+    $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
+    $key      = isset($_GET['key']) ? wc_clean(wp_unslash($_GET['key'])) : '';
+
+    if (!$order_id) {
+      wp_safe_redirect(wc_get_checkout_url());
+      exit;
+    }
+
+    $order = wc_get_order($order_id);
+    if (!$order) {
+      wp_safe_redirect(wc_get_checkout_url());
+      exit;
+    }
+
+    if ($key && $order->get_order_key() !== $key) {
+      $order->add_order_note('[KashPay] Return con order key inválida.');
+      wp_safe_redirect(wc_get_checkout_url());
+      exit;
+    }
+
+    $this->sync_order_status_from_kashpay($order);
+
+    // Redirigir a la página de "order received"
+    wp_safe_redirect($order->get_checkout_order_received_url());
+    exit;
+  }
+
+  /**
+   * Webhook opcional. Ideal si KashPay pega server-to-server.
+   * Puedes hacer que te manden al endpoint: https://tudominio.com/?wc-api=wc_kashpay_webhook
+   */
+  public function handle_webhook() {
+    // Leer body por si envían JSON (depende de KashPay)
+    $raw  = file_get_contents('php://input');
+    $json = json_decode($raw, true);
+
+    // Estrategia: si nos mandan algún identificador, lo usamos. Si no, no rompemos.
+    // Lo más confiable: que nos manden el kash_order_id (UUID).
+    $kash_order_id = '';
+    if (is_array($json)) {
+      $kash_order_id = $json['orderId'] ?? ($json['id'] ?? '');
+    }
+
+    if (!$kash_order_id) {
+      status_header(200);
+      echo 'ok';
+      exit;
+    }
+
+    // Buscar pedido WooCommerce por meta _kashpay_order_id
+    $orders = wc_get_orders([
+      'limit'      => 1,
+      'meta_key'   => '_kashpay_order_id',
+      'meta_value' => sanitize_text_field($kash_order_id),
+      'orderby'    => 'date',
+      'order'      => 'DESC',
+    ]);
+
+    if (!empty($orders)) {
+      $order = $orders[0];
+      $this->sync_order_status_from_kashpay($order);
+    }
+
+    status_header(200);
+    echo 'ok';
+    exit;
+  }
+
+  /**
+   * Consulta KashPay GET /order/{id} y aplica reglas de estado.
+   */
+  private function sync_order_status_from_kashpay(WC_Order $order): void {
+    $kash_order_id = (string) $order->get_meta('_kashpay_order_id');
+    if (!$kash_order_id) {
+      $order->add_order_note('[KashPay] No hay _kashpay_order_id, no se puede verificar.');
+      return;
+    }
+
+    // Idempotencia: si ya está pagado en WooCommerce, no reprocesar
+    if ($order->is_paid()) {
+      return;
+    }
+
+    $res = $this->api()->get_order($kash_order_id);
+
+    if (!$res['ok'] || empty($res['data']['success'])) {
+      $order->add_order_note('[KashPay] Error consultando orden ' . $kash_order_id . '.');
+      return;
+    }
+
+    $remote = $res['data']['order'] ?? [];
+    $status_id = (int) ($remote['status']['statusID'] ?? 0);
+    $amount_remote = isset($remote['amount']) ? (float) $remote['amount'] : null;
+    $currency_remote = isset($remote['currency']) ? (string) $remote['currency'] : null;
+
+    $order->update_meta_data('_kashpay_status_id', $status_id);
+    $order->save();
+
+    // Anti-fraude básico: monto y currency
+    $expected_total = round((float) $order->get_total(), 2);
+
+    if ($amount_remote !== null && round($amount_remote, 2) !== $expected_total) {
+      $order->add_order_note('[KashPay] ALERTA: Monto remoto (' . $amount_remote . ') != total pedido (' . $expected_total . '). No se completa.');
+      $order->update_status('on-hold', '[KashPay] Monto no coincide, requiere revisión.');
+      return;
+    }
+
+    $expected_currency = (string) $this->get_option('currency_code');
+    if ($currency_remote !== null && $currency_remote !== $expected_currency) {
+      $order->add_order_note('[KashPay] ALERTA: Currency remoto (' . $currency_remote . ') != esperado (' . $expected_currency . '). No se completa.');
+      $order->update_status('on-hold', '[KashPay] Moneda no coincide, requiere revisión.');
+      return;
+    }
+
+    // Mapeo de estados:
+    // 13 CREADA, 14 PAGADA, 15 EXPIRADA, 17 PAGO PARCIAL
+    if ($status_id === 14) {
+      $order->payment_complete();
+      $order->add_order_note('[KashPay] Pago confirmado (statusID=14). Pedido completado por gateway.');
+
+      // Opcional: vaciar carrito si el usuario regresa
+      if (function_exists('WC') && WC()->cart) {
+        WC()->cart->empty_cart();
+      }
+      return;
+    }
+
+    if ($status_id === 15) {
+      $order->update_status('failed', '[KashPay] Orden expirada en KashPay (statusID=15).');
+      return;
+    }
+
+    if ($status_id === 17) {
+      $order->update_status('on-hold', '[KashPay] Pago parcial en KashPay (statusID=17).');
+      return;
+    }
+
+    // 13 u otros: mantener pending
+    $order->add_order_note('[KashPay] Estado KashPay actual: ' . $status_id . ' (aún no pagado).');
+  }
+}

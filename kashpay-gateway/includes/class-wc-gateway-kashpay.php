@@ -370,69 +370,59 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     exit;
   }
 
-  private function sync_order_status_from_kashpay(WC_Order $order): void {
+private function sync_order_status_from_kashpay(WC_Order $order): void {
+
     $kash_order_id = (string) $order->get_meta('_kashpay_order_id');
     if (!$kash_order_id) {
-      $order->add_order_note('[KashPay] No hay _kashpay_order_id, no se puede verificar.');
-      return;
+        $order->add_order_note('[KashPay] No hay _kashpay_order_id.');
+        return;
     }
 
     if ($order->is_paid()) {
-      return;
+        return;
     }
 
-    $res = $this->api()->get_order($kash_order_id);
+    $attempts = 0;
+    $status_id = 0;
 
-    $this->log_info('Response get_order(sync): ' . wp_json_encode($res));
+    while ($attempts < 3) {
 
-    if (!$res['ok'] || empty($res['data']['success'])) {
-      $order->add_order_note('[KashPay] Error consultando orden ' . $kash_order_id . '.');
-      return;
-    }
+        $res = $this->api()->get_order($kash_order_id);
 
-    $remote = $res['data']['order'] ?? [];
-    $status_id = (int) ($remote['status']['statusID'] ?? 0);
-    $amount_remote = isset($remote['amount']) ? (float) $remote['amount'] : null;
-    $currency_remote = isset($remote['currency']) ? (string) $remote['currency'] : null;
+        if (!empty($res['ok']) && !empty($res['data']['success'])) {
+            $remote = $res['data']['order'] ?? [];
+            $status_id = (int) ($remote['status']['statusID'] ?? 0);
 
-    $order->update_meta_data('_kashpay_status_id', $status_id);
-    $order->save();
+            if ($status_id === 14) {
+                break;
+            }
+        }
 
-    $expected_total = round((float) $order->get_total(), 2);
-
-    if ($amount_remote !== null && round($amount_remote, 2) !== $expected_total) {
-      $order->add_order_note('[KashPay] ALERTA: Monto remoto (' . $amount_remote . ') != total pedido (' . $expected_total . ').');
-      $order->update_status('on-hold', '[KashPay] Monto no coincide, requiere revisión.');
-      return;
-    }
-
-    $expected_currency = (string) $this->get_option('currency_code');
-    if ($currency_remote !== null && $currency_remote !== $expected_currency) {
-      $order->add_order_note('[KashPay] ALERTA: Currency remoto (' . $currency_remote . ') != esperado (' . $expected_currency . ').');
-      $order->update_status('on-hold', '[KashPay] Moneda no coincide, requiere revisión.');
-      return;
+        sleep(2);
+        $attempts++;
     }
 
     if ($status_id === 14) {
-      $order->payment_complete();
-      $order->add_order_note('[KashPay] Pago confirmado (statusID=14). Pedido completado por gateway.');
+        $order->payment_complete();
+        $order->add_order_note('[KashPay] Pago confirmado (statusID=14).');
 
-      if (function_exists('WC') && WC()->cart) {
-        WC()->cart->empty_cart();
-      }
-      return;
+        if (function_exists('WC') && WC()->cart) {
+            WC()->cart->empty_cart();
+        }
+
+        return;
     }
 
     if ($status_id === 15) {
-      $order->update_status('failed', '[KashPay] Orden expirada en KashPay (statusID=15).');
-      return;
+        $order->update_status('failed', '[KashPay] Orden expirada (statusID=15).');
+        return;
     }
 
     if ($status_id === 17) {
-      $order->update_status('on-hold', '[KashPay] Pago parcial en KashPay (statusID=17).');
-      return;
+        $order->update_status('on-hold', '[KashPay] Pago parcial (statusID=17).');
+        return;
     }
 
-    $order->add_order_note('[KashPay] Estado KashPay actual: ' . $status_id . ' (aún no pagado).');
-  }
+    $order->add_order_note('[KashPay] Estado actual: ' . $status_id);
+}
 }

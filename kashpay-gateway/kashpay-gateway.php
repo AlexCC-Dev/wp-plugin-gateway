@@ -1,9 +1,9 @@
 <?php
 /**
- * Plugin Name: KashPay Gateway for WooCommerce (Custom)
- * Description: Pasarela KashPay/Onsigna para WooCommerce usando OrderReceiver (Link de Pago).
+ * Plugin Name: PosPago Gateway for WooCommerce
+ * Description: Pasarela PosPago para WooCommerce usando OrderReceiver.
  * Version: 0.1.0
- * Author: Coco Cabaret
+ * Author: PosPago
  * Requires Plugins: woocommerce
  */
 

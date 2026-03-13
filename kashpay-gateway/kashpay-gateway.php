@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PosPago Gateway for WooCommerce
  * Description: Pasarela PosPago para WooCommerce usando OrderReceiver.
- * Version: 0.1.0
+ * Version: 1.0.0
  * Author: PosPago
  * Requires Plugins: woocommerce
  */

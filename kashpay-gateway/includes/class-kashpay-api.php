@@ -2,6 +2,10 @@
 if (!defined('ABSPATH')) exit;
 
 class KashPay_API {
+
+  private const URL_PRODUCTION = 'https://api-antares.kashplataforma.com';
+  private const URL_SANDBOX    = 'https://sdbx-antares.kashplataforma.com';
+
   private string $base_url;
   private string $bearer_token;
   private string $entity_i;
@@ -9,17 +13,27 @@ class KashPay_API {
   private bool $sandbox;
 
   public function __construct(
-    string $base_url,
     string $bearer_token,
     string $entity_i = 'com.onsigna',
     bool $debug = false,
     bool $sandbox = false
   ) {
-    $this->base_url     = rtrim($base_url, '/');
+    $this->base_url     = $sandbox ? self::URL_SANDBOX : self::URL_PRODUCTION;
     $this->bearer_token = trim($bearer_token);
     $this->entity_i     = trim($entity_i);
     $this->debug        = $debug;
     $this->sandbox      = $sandbox;
+  }
+
+  /**
+   * Devuelve la base URL activa (útil para logs/debug).
+   */
+  public function get_base_url(): string {
+    return $this->base_url;
+  }
+
+  public function is_sandbox(): bool {
+    return $this->sandbox;
   }
 
   private function headers(): array {
@@ -38,7 +52,7 @@ class KashPay_API {
       'method'    => $method,
       'timeout'   => 25,
       'headers'   => $this->headers(),
-      'sslverify' => $this->sandbox ? false : true,
+      'sslverify' => !$this->sandbox,
     ];
 
     if ($body !== null) {

@@ -5,8 +5,8 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
 
   public function __construct() {
     $this->id                 = 'kashpay';
-    $this->method_title       = 'KashPay';
-    $this->method_description = 'Paga con KashPay (Link de pago) usando OrderReceiver.';
+    $this->method_title       = 'PosPago';
+    $this->method_description = 'Paga con PosPago (Link de pago) usando OrderReceiver.';
     $this->has_fields         = false;
 
     $this->supports = ['products'];
@@ -18,10 +18,29 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     $this->description = $this->get_option('description');
     $this->enabled     = $this->get_option('enabled');
 
+    // Logo en el checkout
+    $this->icon = $this->get_icon_url();
+
     add_action('woocommerce_update_options_payment_gateways_' . $this->id, [$this, 'process_admin_options']);
 
     add_action('woocommerce_api_wc_kashpay_return', [$this, 'handle_return']);
     add_action('woocommerce_api_wc_kashpay_webhook', [$this, 'handle_webhook']);
+  }
+
+  /**
+   * Devuelve la URL del logo de PosPago.
+   */
+  private function get_icon_url(): string {
+    return untrailingslashit(plugin_dir_url(dirname(__FILE__))) . '/assets/pospago-logo.png';
+  }
+
+  /**
+   * Personaliza el HTML del icono en el checkout para controlar el tamaño.
+   */
+  public function get_icon(): string {
+    $icon_url = esc_url($this->icon);
+    $icon_html = '<img src="' . $icon_url . '" alt="' . esc_attr($this->get_title()) . '" style="max-height: 32px; width: auto; margin-left: 8px; vertical-align: middle;" />';
+    return apply_filters('woocommerce_gateway_icon', $icon_html, $this->id);
   }
 
   public function init_form_fields() {
@@ -29,36 +48,31 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       'enabled' => [
         'title'   => 'Habilitar/Deshabilitar',
         'type'    => 'checkbox',
-        'label'   => 'Habilitar KashPay',
+        'label'   => 'Habilitar PosPago',
         'default' => 'no',
       ],
       'title' => [
         'title'   => 'Título',
         'type'    => 'text',
-        'default' => 'KashPay',
+        'default' => 'PosPago',
+        'description' => 'Nombre que ve el cliente en el checkout.',
       ],
       'description' => [
         'title'   => 'Descripción',
         'type'    => 'textarea',
-        'default' => 'Paga de forma segura con KashPay.',
-      ],
-      'base_url' => [
-        'title'       => 'Base URL API',
-        'type'        => 'text',
-        'description' => 'Ej sandbox: https://sdbx-antares.kashplataforma.com',
-        'default'     => 'https://sdbx-antares.kashplataforma.com',
+        'default' => 'Paga de forma segura con PosPago.',
       ],
       'sandbox' => [
-        'title'       => 'Sandbox',
+        'title'       => 'Modo de entorno',
         'type'        => 'checkbox',
-        'label'       => 'Modo sandbox (desactiva verificación SSL SOLO para pruebas)',
-        'default'     => 'yes',
-        'description' => 'En IONOS puede fallar SSL en sandbox. En producción debe estar en NO.',
+        'label'       => 'Activar modo Sandbox (pruebas)',
+        'default'     => 'no',
+        'description' => 'Activado = Sandbox (pruebas). Desactivado = Producción (cobros reales). En sandbox se desactiva la verificación SSL.',
       ],
       'bearer_token' => [
         'title'       => 'Bearer Token',
         'type'        => 'password',
-        'description' => 'Token Bearer de KashPay/Onsigna',
+        'description' => 'Token Bearer de PosPago/Onsigna',
         'default'     => '',
       ],
       'entity_i' => [
@@ -117,7 +131,6 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     $sandbox = ($this->get_option('sandbox') === 'yes');
 
     return new KashPay_API(
-      (string) $this->get_option('base_url'),
       (string) $this->get_option('bearer_token'),
       (string) $this->get_option('entity_i'),
       $debug,
@@ -149,7 +162,7 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     $token    = trim((string) $this->get_option('bearer_token'));
 
     if ($sirio_id === '' || $cashier === '' || $token === '') {
-      wc_add_notice('KashPay no está configurado (sirioID/user/token).', 'error');
+      wc_add_notice('PosPago no está configurado (sirioID/user/token).', 'error');
       return ['result' => 'failure'];
     }
 
@@ -172,12 +185,12 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       $order->delete_meta_data('_kashpay_status_id');
       $order->save();
 
-      $this->log_info('Existing KashPay reference invalid. Meta cleared to regenerate.');
+      $this->log_info('Existing PosPago reference invalid. Meta cleared to regenerate.');
     }
 
     $total = (float) $order->get_total();
     if ($total <= 0) {
-      wc_add_notice('Monto inválido para KashPay.', 'error');
+      wc_add_notice('Monto inválido para PosPago.', 'error');
       return ['result' => 'failure'];
     }
 
@@ -233,7 +246,7 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       $msg = 'No se pudo crear el link de pago.';
 
       if (!empty($res['error']) && stripos($res['error'], 'cURL error 60') !== false) {
-        $msg = 'No se pudo conectar con KashPay (error SSL del servidor).';
+        $msg = 'No se pudo conectar con PosPago (error SSL del servidor).';
       }
 
       if (!empty($res['data']['error'])) {
@@ -242,20 +255,24 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
         $msg .= ' Respuesta: ' . wp_strip_all_tags(substr((string)$res['data']['raw'], 0, 180));
       }
 
-      $order->add_order_note('[KashPay] Error creando orden: ' . $msg);
+      $order->add_order_note('[PosPago] Error creando orden: ' . $msg);
       wc_add_notice($msg, 'error');
       return ['result' => 'failure'];
     }
 
     $data = $res['data'];
 
-    $kash_order_id = $data['payOrderResponse']['order']['id'] ?? '';
+    // La API puede devolver el ID en payOrderResponse.order.id (sandbox)
+    // o directamente en payOrderResponse.id (producción). Soportamos ambos.
+    $kash_order_id = $data['payOrderResponse']['order']['id']
+                  ?? $data['payOrderResponse']['id']
+                  ?? '';
     $pay_url       = $data['payOrderResponse']['payOrder'] ?? '';
     $form_url      = $data['payOrderResponse']['formUrl'] ?? '';
 
     if (!$kash_order_id || (!$pay_url && !$form_url)) {
-      $order->add_order_note('[KashPay] Respuesta inesperada al crear orden.');
-      wc_add_notice('Respuesta inesperada de KashPay (sin URL de pago).', 'error');
+      $order->add_order_note('[PosPago] Respuesta inesperada al crear orden.');
+      wc_add_notice('Respuesta inesperada de PosPago (sin URL de pago).', 'error');
       return ['result' => 'failure'];
     }
 
@@ -266,7 +283,7 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     $order->update_meta_data('_kashpay_status_id', 13);
     $order->save();
 
-    $order->update_status('pending', '[KashPay] Link de pago generado. Redirigiendo a KashPay.');
+    $order->update_status('pending', '[PosPago] Link de pago generado. Redirigiendo a PosPago.');
 
     return [
       'result'   => 'success',
@@ -326,7 +343,7 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     }
 
     if ($key && $order->get_order_key() !== $key) {
-      $order->add_order_note('[KashPay] Return con order key inválida.');
+      $order->add_order_note('[PosPago] Return con order key inválida.');
       wp_safe_redirect(wc_get_checkout_url());
       exit;
     }
@@ -370,16 +387,16 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     exit;
   }
 
-private function sync_order_status_from_kashpay(WC_Order $order): void {
+  private function sync_order_status_from_kashpay(WC_Order $order): void {
 
     $kash_order_id = (string) $order->get_meta('_kashpay_order_id');
     if (!$kash_order_id) {
-        $order->add_order_note('[KashPay] No hay _kashpay_order_id.');
-        return;
+      $order->add_order_note('[PosPago] No hay _kashpay_order_id.');
+      return;
     }
 
     if ($order->is_paid()) {
-        return;
+      return;
     }
 
     $attempts = 0;
@@ -387,42 +404,42 @@ private function sync_order_status_from_kashpay(WC_Order $order): void {
 
     while ($attempts < 3) {
 
-        $res = $this->api()->get_order($kash_order_id);
+      $res = $this->api()->get_order($kash_order_id);
 
-        if (!empty($res['ok']) && !empty($res['data']['success'])) {
-            $remote = $res['data']['order'] ?? [];
-            $status_id = (int) ($remote['status']['statusID'] ?? 0);
+      if (!empty($res['ok']) && !empty($res['data']['success'])) {
+        $remote = $res['data']['order'] ?? [];
+        $status_id = (int) ($remote['status']['statusID'] ?? 0);
 
-            if ($status_id === 14) {
-                break;
-            }
+        if ($status_id === 14) {
+          break;
         }
+      }
 
-        sleep(2);
-        $attempts++;
+      sleep(2);
+      $attempts++;
     }
 
     if ($status_id === 14) {
-        $order->payment_complete();
-        $order->add_order_note('[KashPay] Pago confirmado (statusID=14).');
+      $order->payment_complete();
+      $order->add_order_note('[PosPago] Pago confirmado (statusID=14).');
 
-        if (function_exists('WC') && WC()->cart) {
-            WC()->cart->empty_cart();
-        }
+      if (function_exists('WC') && WC()->cart) {
+        WC()->cart->empty_cart();
+      }
 
-        return;
+      return;
     }
 
     if ($status_id === 15) {
-        $order->update_status('failed', '[KashPay] Orden expirada (statusID=15).');
-        return;
+      $order->update_status('failed', '[PosPago] Orden expirada (statusID=15).');
+      return;
     }
 
     if ($status_id === 17) {
-        $order->update_status('on-hold', '[KashPay] Pago parcial (statusID=17).');
-        return;
+      $order->update_status('on-hold', '[PosPago] Pago parcial (statusID=17).');
+      return;
     }
 
-    $order->add_order_note('[KashPay] Estado actual: ' . $status_id);
-}
+    $order->add_order_note('[PosPago] Estado actual: ' . $status_id);
+  }
 }

@@ -21,27 +21,43 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     // Logo en el checkout
     $this->icon = $this->get_icon_url();
 
+    // Admin: guardar opciones
     add_action('woocommerce_update_options_payment_gateways_' . $this->id, [$this, 'process_admin_options']);
 
+    // Callback y webhook
     add_action('woocommerce_api_wc_kashpay_return', [$this, 'handle_return']);
     add_action('woocommerce_api_wc_kashpay_webhook', [$this, 'handle_webhook']);
+
+    // === AUTO-VERIFICACIÓN ===
+    add_action('woocommerce_thankyou_' . $this->id, [$this, 'check_order_on_thankyou']);
+    add_action('woocommerce_view_order', [$this, 'check_order_on_view'], 1);
+    add_action('kashpay_cron_check_pending_orders', [$this, 'cron_check_pending_orders']);
+
+    if (!is_admin() && !wp_doing_cron()) {
+      add_action('wp_loaded', [$this, 'check_pending_orders_for_current_user']);
+    }
+
+    // Limpiar token cacheado cuando se cambia de modo sandbox/producción
+    add_action('woocommerce_update_options_payment_gateways_' . $this->id, [$this, 'clear_cached_token_on_save']);
   }
 
-  /**
-   * Devuelve la URL del logo de PosPago.
-   */
+  // =========================================================================
+  //  LOGO & ICON
+  // =========================================================================
+
   private function get_icon_url(): string {
     return untrailingslashit(plugin_dir_url(dirname(__FILE__))) . '/assets/pospago-logo.png';
   }
 
-  /**
-   * Personaliza el HTML del icono en el checkout para controlar el tamaño.
-   */
   public function get_icon(): string {
     $icon_url = esc_url($this->icon);
     $icon_html = '<img src="' . $icon_url . '" alt="' . esc_attr($this->get_title()) . '" style="max-height: 32px; width: auto; margin-left: 8px; vertical-align: middle;" />';
     return apply_filters('woocommerce_gateway_icon', $icon_html, $this->id);
   }
+
+  // =========================================================================
+  //  FORM FIELDS (Admin)
+  // =========================================================================
 
   public function init_form_fields() {
     $this->form_fields = [
@@ -52,9 +68,9 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
         'default' => 'no',
       ],
       'title' => [
-        'title'   => 'Título',
-        'type'    => 'text',
-        'default' => 'PosPago',
+        'title'       => 'Título',
+        'type'        => 'text',
+        'default'     => 'PosPago',
         'description' => 'Nombre que ve el cliente en el checkout.',
       ],
       'description' => [
@@ -67,13 +83,39 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
         'type'        => 'checkbox',
         'label'       => 'Activar modo Sandbox (pruebas)',
         'default'     => 'no',
-        'description' => 'Activado = Sandbox (pruebas). Desactivado = Producción (cobros reales). En sandbox se desactiva la verificación SSL.',
+        'description' => 'Activado = Sandbox (pruebas). Desactivado = Producción (cobros reales).',
+      ],
+
+      // --- Credenciales de autenticación (producción: auto-generación de token) ---
+      'auth_section' => [
+        'title'       => 'Autenticación',
+        'type'        => 'title',
+        'description' => 'Credenciales para generar el Bearer Token automáticamente en producción. En Sandbox se usa el Bearer Token manual de abajo.',
+      ],
+      'auth_user' => [
+        'title'       => 'Auth User',
+        'type'        => 'text',
+        'description' => 'Usuario de autenticación (sirioID del comercio). Se usa para auto-generar el token en producción.',
+        'default'     => '',
+      ],
+      'auth_password' => [
+        'title'       => 'Auth Password',
+        'type'        => 'password',
+        'description' => 'Contraseña de autenticación. Se usa para auto-generar el token en producción.',
+        'default'     => '',
       ],
       'bearer_token' => [
-        'title'       => 'Bearer Token',
+        'title'       => 'Bearer Token (Sandbox)',
         'type'        => 'password',
-        'description' => 'Token Bearer de PosPago/Onsigna',
+        'description' => 'Token Bearer manual. Se usa solo en modo Sandbox. En producción el token se genera automáticamente.',
         'default'     => '',
+      ],
+
+      // --- Configuración del comercio ---
+      'commerce_section' => [
+        'title'       => 'Configuración del comercio',
+        'type'        => 'title',
+        'description' => '',
       ],
       'entity_i' => [
         'title'   => 'Entity-i',
@@ -126,6 +168,10 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     ];
   }
 
+  // =========================================================================
+  //  API & LOGGING
+  // =========================================================================
+
   private function api(): KashPay_API {
     $debug   = ($this->get_option('debug') === 'yes');
     $sandbox = ($this->get_option('sandbox') === 'yes');
@@ -134,8 +180,18 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       (string) $this->get_option('bearer_token'),
       (string) $this->get_option('entity_i'),
       $debug,
-      $sandbox
+      $sandbox,
+      (string) $this->get_option('auth_user'),
+      (string) $this->get_option('auth_password')
     );
+  }
+
+  /**
+   * Limpia el token cacheado cuando se guardan los settings.
+   */
+  public function clear_cached_token_on_save(): void {
+    delete_transient('kashpay_bearer_token');
+    delete_transient('kashpay_bearer_token_expires');
   }
 
   private function log_info(string $msg): void {
@@ -150,6 +206,10 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     }
   }
 
+  // =========================================================================
+  //  PROCESS PAYMENT
+  // =========================================================================
+
   public function process_payment($order_id) {
     $order = wc_get_order($order_id);
     if (!$order) {
@@ -159,10 +219,9 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
 
     $sirio_id = trim((string) $this->get_option('sirio_id'));
     $cashier  = trim((string) $this->get_option('cashier_user'));
-    $token    = trim((string) $this->get_option('bearer_token'));
 
-    if ($sirio_id === '' || $cashier === '' || $token === '') {
-      wc_add_notice('PosPago no está configurado (sirioID/user/token).', 'error');
+    if ($sirio_id === '' || $cashier === '') {
+      wc_add_notice('PosPago no está configurado (sirioID/user).', 'error');
       return ['result' => 'failure'];
     }
 
@@ -174,6 +233,15 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       $this->log_info('Response get_order(existing): ' . wp_json_encode($check));
 
       if (!empty($check['ok']) && !empty($check['data']['success'])) {
+        $remote_status = (int) ($check['data']['order']['status']['statusID'] ?? 0);
+        if ($remote_status === 14) {
+          $this->sync_order_status_from_kashpay($order);
+          return [
+            'result'   => 'success',
+            'redirect' => $order->get_checkout_order_received_url(),
+          ];
+        }
+
         $pay_url = (string) $order->get_meta('_kashpay_pay_url');
         if ($pay_url !== '') {
           return ['result' => 'success', 'redirect' => $pay_url];
@@ -195,7 +263,7 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     }
 
     $expiration_minutes = max(5, (int) $this->get_option('expiration_minutes'));
-    $expiration_iso     = gmdate('Y-m-d\TH:i:s', time() + ($expiration_minutes * 60)); // UTC
+    $expiration_iso     = gmdate('Y-m-d\TH:i:s', time() + ($expiration_minutes * 60));
 
     $return_url = add_query_arg([
       'wc-api'   => 'wc_kashpay_return',
@@ -262,8 +330,6 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
 
     $data = $res['data'];
 
-    // La API puede devolver el ID en payOrderResponse.order.id (sandbox)
-    // o directamente en payOrderResponse.id (producción). Soportamos ambos.
     $kash_order_id = $data['payOrderResponse']['order']['id']
                   ?? $data['payOrderResponse']['id']
                   ?? '';
@@ -290,6 +356,10 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       'redirect' => $redirect,
     ];
   }
+
+  // =========================================================================
+  //  HELPERS
+  // =========================================================================
 
   private function build_rrc(WC_Order $order): string {
     $base = 'WC' . $order->get_id() . '-' . time();
@@ -327,6 +397,10 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     return $items;
   }
 
+  // =========================================================================
+  //  RETURN & WEBHOOK HANDLERS
+  // =========================================================================
+
   public function handle_return() {
     $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
     $key      = isset($_GET['key']) ? wc_clean(wp_unslash($_GET['key'])) : '';
@@ -348,6 +422,7 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       exit;
     }
 
+    $this->log_info('[Return] Callback recibido para pedido #' . $order_id);
     $this->sync_order_status_from_kashpay($order);
 
     wp_safe_redirect($order->get_checkout_order_received_url());
@@ -369,6 +444,8 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       exit;
     }
 
+    $this->log_info('[Webhook] Recibido para kashpay_order_id=' . $kash_order_id);
+
     $orders = wc_get_orders([
       'limit'      => 1,
       'meta_key'   => '_kashpay_order_id',
@@ -387,15 +464,103 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     exit;
   }
 
-  private function sync_order_status_from_kashpay(WC_Order $order): void {
+  // =========================================================================
+  //  AUTO-VERIFICACIÓN
+  // =========================================================================
 
-    $kash_order_id = (string) $order->get_meta('_kashpay_order_id');
-    if (!$kash_order_id) {
-      $order->add_order_note('[PosPago] No hay _kashpay_order_id.');
+  public function check_order_on_thankyou(int $order_id): void {
+    $order = wc_get_order($order_id);
+    if (!$order || $order->is_paid() || $order->get_payment_method() !== $this->id) {
+      return;
+    }
+    $this->log_info('[AutoCheck:ThankYou] Verificando pedido #' . $order_id);
+    $this->sync_order_status_from_kashpay($order);
+  }
+
+  public function check_order_on_view(int $order_id): void {
+    $order = wc_get_order($order_id);
+    if (!$order || $order->is_paid() || $order->get_payment_method() !== $this->id) {
+      return;
+    }
+    $order_date = $order->get_date_created();
+    if ($order_date && (time() - $order_date->getTimestamp()) > 86400) {
+      return;
+    }
+    $this->log_info('[AutoCheck:ViewOrder] Verificando pedido #' . $order_id);
+    $this->sync_order_status_from_kashpay($order);
+  }
+
+  public function check_pending_orders_for_current_user(): void {
+    $user_id = get_current_user_id();
+    if (!$user_id) {
+      return;
+    }
+    $transient_key = 'kashpay_check_user_' . $user_id;
+    if (get_transient($transient_key)) {
+      return;
+    }
+    set_transient($transient_key, 1, 60);
+
+    $orders = wc_get_orders([
+      'limit'          => 5,
+      'customer_id'    => $user_id,
+      'status'         => ['pending'],
+      'payment_method' => $this->id,
+      'meta_key'       => '_kashpay_order_id',
+      'meta_compare'   => 'EXISTS',
+      'date_created'   => '>' . (time() - 7200),
+      'orderby'        => 'date',
+      'order'          => 'DESC',
+    ]);
+
+    if (empty($orders)) {
       return;
     }
 
-    if ($order->is_paid()) {
+    $this->log_info('[AutoCheck:PageLoad] Usuario #' . $user_id . ' - ' . count($orders) . ' pedidos pendientes.');
+
+    foreach ($orders as $order) {
+      if (!$order->is_paid()) {
+        $this->sync_order_status_from_kashpay($order);
+      }
+    }
+  }
+
+  public function cron_check_pending_orders(): void {
+    $orders = wc_get_orders([
+      'limit'          => 20,
+      'status'         => ['pending', 'on-hold'],
+      'payment_method' => $this->id,
+      'meta_key'       => '_kashpay_order_id',
+      'meta_compare'   => 'EXISTS',
+      'date_created'   => '>' . (time() - 86400),
+      'orderby'        => 'date',
+      'order'          => 'DESC',
+    ]);
+
+    if (empty($orders)) {
+      return;
+    }
+
+    $this->log_info('[Cron] Revisando ' . count($orders) . ' pedidos pendientes.');
+
+    foreach ($orders as $order) {
+      if ($order->is_paid()) {
+        continue;
+      }
+      $this->log_info('[Cron] Verificando pedido #' . $order->get_id());
+      $this->sync_order_status_from_kashpay($order);
+      usleep(500000);
+    }
+  }
+
+  // =========================================================================
+  //  SYNC STATUS
+  // =========================================================================
+
+  private function sync_order_status_from_kashpay(WC_Order $order): void {
+    $kash_order_id = (string) $order->get_meta('_kashpay_order_id');
+    if (!$kash_order_id || $order->is_paid()) {
       return;
     }
 
@@ -403,14 +568,15 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     $status_id = 0;
 
     while ($attempts < 3) {
-
       $res = $this->api()->get_order($kash_order_id);
+
+      $this->log_info('[Sync] GET order ' . $kash_order_id . ' attempt=' . ($attempts + 1) . ' status_code=' . ($res['status'] ?? '?'));
 
       if (!empty($res['ok']) && !empty($res['data']['success'])) {
         $remote = $res['data']['order'] ?? [];
         $status_id = (int) ($remote['status']['statusID'] ?? 0);
 
-        if ($status_id === 14) {
+        if ($status_id === 14 || $status_id === 13 || $status_id === 15 || $status_id === 17) {
           break;
         }
       }
@@ -419,14 +585,14 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       $attempts++;
     }
 
+    $this->log_info('[Sync] Pedido #' . $order->get_id() . ' statusID=' . $status_id);
+
     if ($status_id === 14) {
       $order->payment_complete();
       $order->add_order_note('[PosPago] Pago confirmado (statusID=14).');
-
       if (function_exists('WC') && WC()->cart) {
         WC()->cart->empty_cart();
       }
-
       return;
     }
 
@@ -440,6 +606,8 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       return;
     }
 
-    $order->add_order_note('[PosPago] Estado actual: ' . $status_id);
+    if ($status_id > 0) {
+      $order->add_order_note('[PosPago] Estado actual: ' . $status_id);
+    }
   }
 }

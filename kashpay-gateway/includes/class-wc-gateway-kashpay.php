@@ -433,18 +433,28 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
     $raw  = file_get_contents('php://input');
     $json = json_decode($raw, true);
 
+    // Log del body completo para debug
+    $this->log_info('[Webhook] Body recibido: ' . substr($raw, 0, 2000));
+
     $kash_order_id = '';
     if (is_array($json)) {
-      $kash_order_id = $json['orderId'] ?? ($json['id'] ?? '');
+      // Buscar el ID de la orden en todas las ubicaciones posibles del JSON
+      $kash_order_id = $json['orderId']
+                    ?? $json['id']
+                    ?? $json['order']['id']
+                    ?? $json['payOrderResponse']['order']['id']
+                    ?? $json['payOrderResponse']['id']
+                    ?? '';
     }
 
     if (!$kash_order_id) {
+      $this->log_info('[Webhook] No se encontró ID de orden en el JSON recibido.');
       status_header(200);
       echo 'ok';
       exit;
     }
 
-    $this->log_info('[Webhook] Recibido para kashpay_order_id=' . $kash_order_id);
+    $this->log_info('[Webhook] Procesando kashpay_order_id=' . $kash_order_id);
 
     $orders = wc_get_orders([
       'limit'      => 1,
@@ -456,7 +466,10 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
 
     if (!empty($orders)) {
       $order = $orders[0];
+      $this->log_info('[Webhook] Pedido WC #' . $order->get_id() . ' encontrado. Sincronizando...');
       $this->sync_order_status_from_kashpay($order);
+    } else {
+      $this->log_info('[Webhook] No se encontró pedido WC con kashpay_order_id=' . $kash_order_id);
     }
 
     status_header(200);

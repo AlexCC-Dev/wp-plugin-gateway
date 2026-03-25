@@ -127,6 +127,12 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
         'type'    => 'text',
         'default' => '',
       ],
+      'ordering_account' => [
+        'title'       => 'orderingAccount (CLABE)',
+        'type'        => 'text',
+        'description' => 'CLABE interbancaria del comercio. Se encuentra en el portal de PosPago en "Detalle de saldo".',
+        'default'     => '',
+      ],
       'cashier_user' => [
         'title'   => 'user (cajero)',
         'type'    => 'text',
@@ -275,6 +281,7 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
       'user' => $cashier,
       'amount' => round($total, 2),
       'sirioID' => $sirio_id,
+      'orderingAccount' => (string) $this->get_option('ordering_account'),
       'paymentType' => (int) $this->get_option('payment_type'),
       'paymentMethod' => [
         'paymentMethodID' => (int) $this->get_option('payment_method_id'),
@@ -299,6 +306,11 @@ class WC_Gateway_KashPay extends WC_Payment_Gateway {
         'urlCallback' => $return_url,
         'urlImage'    => '',
       ],
+      'payPhone'     => null,
+      'payEmail'     => null,
+      'referenceOne' => null,
+      'referenceTwo' => null,
+      'referenceThree' => null,
       'otherAmount' => 0.0,
       'msi' => false,
       'tip' => false,

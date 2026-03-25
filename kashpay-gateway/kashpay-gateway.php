@@ -4,6 +4,7 @@
  * Description: Pasarela PosPago para WooCommerce usando OrderReceiver.
  * Version: 1.1.0
  * Author: PosPago
+ * Author URI: https://pospago.mx
  * Requires Plugins: woocommerce
  */
 
